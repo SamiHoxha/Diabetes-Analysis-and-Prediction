@@ -1,0 +1,448 @@
+---
+title: "Analiza dhe Parashikimi i Diabetit"
+author: "Sami Hoxha"
+date: "2025-06-30"
+output:
+  pdf_document: default
+  word_document: default
+  html_document: default
+---
+
+### 1) Instalimi i paketave të nevojshme
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# Paketat
+library(readxl)
+library(tidyverse)
+library(caret)
+library(pROC)
+library(xgboost)
+library(corrplot)
+library(factoextra)
+library(randomForest)
+library(class)
+library(e1071)
+```
+
+
+### 2) Ngarkimi i datasetit dhe informacione të përgjithshme rreth tij
+```{r}
+# Leximi i datasetit
+data <- read_excel("diabetes.xlsx")
+
+# Informacione të përgjithshme rreth tij
+head(data)
+str(data)
+summary(data)
+```
+
+Në këtë seksion është bërë eksplorimi fillestar i datasetit:
+Dataseti përbëhet nga 768 rreshta dhe 9 variabla, si: Pregnancies, Glucose, BloodPressure, SkinThickness, Insulin, BMI, DiabetesPedigreeFunction, Age dhe Outcome.
+Outcome është variabli target, ku:
+0 = individi nuk ka diabet
+1 = individi ka diabet
+
+Ky është një dataset standard i përdorur shpesh në klasifikimin e diabetit dhe vjen nga Pima Indians dataset. Ai përmban si të dhëna shëndetësore, ashtu edhe veçori demografike.
+
+Vërejmë që kolonat Glucose, BloodPressure, SkinThickness, Insulin dhe BMI kanë vlerë minimale 0, gjë që nuk është normale që këto veçori të marrin vlerë 0 për ndonjë individ.
+
+Dataseti nuk përmban të dhëna si gjinia, statusi ekonomik etj.
+
+### 3) Pastrimi dhe përgatitja e të dhënave ( Data preprocessing )
+```{r}
+# Kontrollojmë për vlera 0 në kolonat që nuk duhet të ketë 0
+sapply(data, function(x) sum(x == 0))
+
+# Zëvendësojmë 0 me NA ku nuk ka kuptim
+na_cols <- c("Glucose", "BloodPressure", "SkinThickness", "Insulin", "BMI")
+for (col in na_cols) {
+  data[[col]][data[[col]] == 0] <- NA
+}
+
+# Plotësojmë NA me mesoren
+for (col in na_cols) {
+  data[[col]][is.na(data[[col]])] <- median(data[[col]], na.rm = TRUE)
+}
+
+# Kontrollojmë të dhënat
+summary(data)
+```
+
+Zëvendësimi i vlerave 0 me NA është teknikë standarde kur bëhet fjalë për mungesë të dhënash që janë të shprehura gabimisht si zero. Kjo është me rëndësi për të shmangur devijime në analizën statistikore ose në modelim.
+Gjithashtu vlerat që mungojnë tashmë në dataset u zëvendësuan me mesoren si vlerën më të përshtatshme për secilin variabël.
+
+### 4) Analiza eksploruese e të dhënave (EDA)
+
+##### 4.1 Histogramet e shpërndarjes së të dhënave
+```{r}
+data %>%
+  gather(key = "Variable", value = "Value", -Outcome) %>%
+  ggplot(aes(x = Value)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black") +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal()
+```
+
+Glucose: Ka një shpërndarje të njëanshme (right-skewed). Vlerat më të larta kanë më shumë gjasa të jenë të lidhura me diabet.
+BMI: Ka një shpërndarje mjaft të përhapur, me vlera mbi 40 që tregojnë obezitet të lartë.
+Insulin: Ka shumë vlera të ulëta/zero, prandaj u zëvendësuan me NA.
+DiabetesPedigreeFunction: Shumica e vlerave janë të vogla (< 1), por ka disa raste ekstreme.
+Qëllimi i histogramit ishte zbulimi i shpërndarjeve jo-normale, outliers dhe trajtime të mundshme për transformime ose standardizim.
+
+##### 4.2 Boxplot: Shpërndarja e BMI-së sipas Statusit të Diabetit
+```{r}
+ggplot(data, aes(x = factor(Outcome), y = BMI, fill = factor(Outcome))) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("Pa Diabet", "Me Diabet")) +
+  labs(
+    x = "Statusi i Diabetit",
+    y = "BMI",
+    title = "Shpërndarja e BMI-së sipas Statusit të Diabetit"
+  ) +
+  theme_minimal()
+```
+
+Shikojmë që BMI është më e lartë tek personat me diabet se tek ato pa diabet. Shikojmë outliers në të dy grafikët por më shumë tek personat me diabet duke treguar persona me nivel shumë të lartë të BMI-së.
+
+##### 4.3 Density plot për glukozën
+```{r}
+ggplot(data, aes(x = Glucose, fill = factor(Outcome))) +
+  geom_density(alpha = 0.5) +
+  labs(
+    title = "Density Plot për Glukozën në lidhje me Diabetin",
+    fill = "Statusi i Diabetit"
+  ) +
+  scale_fill_manual(values = c("0" = "skyblue", "1" = "salmon"),
+                    labels = c("Pa Diabet", "Me Diabet")) +
+  theme_minimal()
+```
+
+Grafiku i densitetit për Glucose tregon një shpërndarje jo normale (asimetrike në të djathtë).
+Ka një përqendrim të lartë të vlerave në intervalin 100–130 mg/dL, që është rreth kufijve klinikë për glukozën.
+Ka një bisht të gjatë në të djathtë, që do të thotë se disa pacientë kanë nivele shumë të larta të glukozës (> 180 mg/dL), të cilat janë vlera jashtëzakonisht të larta klinikisht dhe mund të konsiderohen outliers.
+
+Karakteristikat statistikore të nënkuptuara:
+Mean > Median: Kjo është tipike për shpërndarje me asimetri në të djathtë.
+Kurtosis e mundshme e lartë: Prania e një kulmi të mprehtë dhe bishti i gjatë sugjerojnë një përqendrim të lartë të vlerave pranë mesatares, por me outliers.
+
+##### 4.4 Matrica e korrelacionit
+```{r}
+cor_mat <- cor(data[, -which(names(data) == "Outcome")])
+corrplot(cor_mat, method = "color", type = "upper", 
+         tl.cex = 0.8, number.cex = 0.7,
+         addCoef.col = "black", diag = FALSE)
+```
+
+Glucose dhe Insulin: korrelacion pozitiv të moderuar.
+BMI dhe SkinThickness: korrelacion pozitiv, e pritshme sepse lidhen me yndyrën trupore.
+Outcome ka lidhje pozitive me Glucose, BMI, Age, dhe DPF, kjo sugjeron përdorim të tyre në modele klasifikimi.
+
+##### 4.5 Grafiku rrethor për ndarjen e rasteve me diabet sipas gjinisë
+```{r}
+# Ndarja e nivelit të glukozës në kategori
+data_kategorizuar <- data %>%
+  mutate(Kategoria_Glukozes = case_when(
+    Glucose < 100 ~ "E ulët",
+    Glucose >= 100 & Glucose < 140 ~ "Normale",
+    Glucose >= 140 ~ "E lartë"
+  ))
+# Filtrojmë vetëm ata me diabet
+vetem_diabetiket <- data_kategorizuar %>% filter(Outcome == 1)
+
+# Numërojmë sipas kategorive
+summary_glucose <- vetem_diabetiket %>%
+  group_by(Kategoria_Glukozes) %>%
+  summarise(Numri = n())
+
+# Pie chart
+ggplot(summary_glucose, aes(x = "", y = Numri, fill = Kategoria_Glukozes)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y") +
+  labs(title = "Shpërndarja e glukozës tek personat me diabet", fill = "Glukoza") +
+  theme_void()
+
+
+```
+
+Shikojmë që rreth 50% e personave me diabet kanë një nivel shumë të lartë të glukozës në gjak, mbi 40% kanë nivel normal dhe pjesa tjetër kanë nivelin e glukozës në gjak të ulët.
+
+### 5) Cluster Analysis
+
+##### 5.1 Përgatitja e veçorive për klaster-at
+```{r}
+data_features <- data[, setdiff(names(data), "Outcome")]
+data_scaled <- scale(data_features)
+```
+
+
+##### 5.2 Klaster K-means me 3 klasterë
+```{r}
+set.seed(123)
+kmeans_result <- kmeans(data_scaled, centers = 3, nstart = 25)
+# Kontrollojmë sa raste nga Outcome 0/1 bien në secilin klaster
+table(kmeans_result$cluster, data$Outcome)
+```
+
+Klasteri 1:
+293 nga 337 raste janë Outcome = 0, pra afërsisht 86.9% janë pa sëmundjen e diabetit. Ky klaster duhet të përfaqësojë mirë personat pa diabet.
+
+Klasteri 2:
+128 nga 248 janë Outcome = 1, pra afërsisht ~51.6% janë me diabet. Ky është një klaster i përzier, pak më i prirur për Outcome = 1.
+
+Klasteri 3:
+96 nga 183 janë Outcome = 1, pra afërsisht 52.5% me diabet. Edhe ky klaster është neutral, por pak më shumë ka individë me diabet.
+
+##### 5.3 Vizualizimi i Klaster-it
+```{r}
+fviz_cluster(kmeans_result, data = data_scaled,
+             geom = "point",
+             ellipse.type = "convex",
+             ggtheme = theme_minimal())
+```
+
+Metoda e përdorur është K-Means Clustering.
+
+3 grupe janë identifikuar nëpërmjet fviz_cluster() dhe PCA.
+Grupet nuk janë shumë të ndarë, pra ka mbivendosje të konsiderueshme midis klasave, sidomos në dimensionet kryesore.
+
+Plot PCA (Analiza e Komponentëve Kryesore) sugjeron se disa variabla kontribuojnë fuqishëm në ndarjen e klasave, si Glucose, BMI, dhe Age.
+Analizë për veprim:
+
+Rezultatet sugjerojnë nivele të ulëta të ndarjes natyrore midis pacientëve në bazë të të dhënave të mbledhura.
+Kjo mund të nënkuptojë se modeli klasifikues do ketë vështirësi të ndajë klasat në mënyrë të qartë.
+
+### 5) Ndarja e të dhënave në trajnimi/testim dhe përgatitja e të dhënave
+```{r}
+set.seed(42)
+
+# Ndarja në train (80%) dhe test (20%)
+split <- createDataPartition(data$Outcome, p = 0.8, list = FALSE)
+train_data <- data[split, ]
+test_data <- data[-split, ]
+
+# Konvertimi i Outcome në faktor me nivelet 0 dhe 1
+train_data$Outcome <- factor(train_data$Outcome, levels = c(0, 1))
+test_data$Outcome <- factor(test_data$Outcome, levels = c(0, 1))
+
+# Nxjerrja e labels si numerik (0 dhe 1)
+train_label <- as.numeric(as.character(train_data$Outcome))
+test_label <- as.numeric(as.character(test_data$Outcome))
+```
+
+
+### 6) Modeli i Regresit Logjistik
+```{r}
+# Modeli logjistik
+model_log <- glm(Outcome ~ ., data = train_data, family = binomial)
+summary(model_log)
+
+# Parashikimi me anë të modelit
+probabilities <- predict(model_log, test_data, type = "response")
+predictions <- ifelse(probabilities > 0.5, 1, 0)
+
+# Vlerësimi i modelit 
+confusionMatrix(as.factor(predictions), as.factor(test_data$Outcome))
+```
+
+Në këtë analizë u trajtua një model klasifikimi binar për parashikimin e probabilitetit që një individ të ketë Outcome = 1. Modeli u vlerësua duke përdorur disa metrika kryesore të performancës.
+
+1. Performanca e Modelit
+Saktësia (Accuracy) arriti në nivelin rreth 77%, që tregon se modeli klasifikon me saktësi rreth 77 nga 100 raste.
+Për të vlerësuar më mirë aftësinë ndarëse të modelit midis klasave pozitive dhe negative, u analizua kurba ROC dhe u përllogarita AUC = 0.82.
+Vlera e AUC mbi 0.8 tregon një performancë të mirë në dallimin e rasteve me Outcome = 1 dhe atyre me Outcome = 0.
+
+2. Analiza e Kurvës ROC
+Kurba ROC ilustron balancën midis True Positive Rate dhe False Positive Rate.
+Një AUC prej 0.82 nënkupton që probabiliteti që modeli të rendisë rastin pozitiv më lart se një rast negativ është 83%, duke treguar aftësi të mirë diskriminimi.
+
+3. Interpretueshmëria e Modelit
+Nga analiza e koeficientëve të modelit, u vu re se veçoritë Glucose dhe BMI kanë p-vlera shumë të ulëta.
+Kjo nënkupton se këto dy variabla kanë ndikim statistikor domethënës në parashikimin e Outcome = 1 dhe janë faktorë kryesorë në model.
+Modeli i përdorur ofron transparencë dhe interpretueshmëri përkatëse, duke lejuar të kuptojmë lidhjen e veçorive me rezultatin.
+
+4. Kufizime dhe Sugjerime
+Modeli supozon një marrëdhënie lineare midis variablave dhe probabilitetit të Outcome = 1, prandaj mund të mos kapë marrëdhënie më komplekse ose jo-lineare.
+Për modelime më të avancuara dhe përmirësim të performancës të modelit.
+
+### 7) Vlerësimi i performancës (ROC, AUC) për modelin e regresit logjistik
+```{r}
+roc_obj <- roc(test_data$Outcome, probabilities)
+plot(roc_obj, col = "blue")
+auc(roc_obj)
+
+```
+
+
+### 8) Modeli Random Forest
+```{r}
+set.seed(42)
+model_rf <- randomForest(as.factor(Outcome) ~ ., data = train_data, importance = TRUE)
+
+# Parashikimi
+pred_rf <- predict(model_rf, test_data)
+
+# Vlerësimi i modelit
+confusionMatrix(pred_rf, as.factor(test_data$Outcome))
+
+# Rëndësia e veçorive
+varImpPlot(model_rf)
+```
+
+Modeli Random Forest, një algoritëm ensambël i bazuar në shumë pemë vendimmarrjeje, është trajnuar për të klasifikuar një variabël binare (Outcome: 0 ose 1). Rezultatet tregojnë një performancë të mirë në identifikimin e rasteve pozitive dhe një ekuilibër të pranueshëm në klasifikim.
+
+Saktësia e përgjithshme
+
+Modeli arriti një accuracy prej 78.4%, që do të thotë se pothuajse 4 nga 5 parashikime ishin të sakta. Ky rezultat është dukshëm i mirë. Kjo mbështetet edhe nga një p-vlerë shumë e ulët (0.00016), që tregon se përmirësimi është statistikisht domethënës.
+
+Ekuilibri midis klasave
+
+Një nga vlerësimet më të rëndësishme në klasifikim binar është balanca midis klasave, veçanërisht nëse klasat janë të pa balancuara. Ky model ka një sensitivity prej 87.9%, që do të thotë se është shumë efektiv në zbulimin e rasteve të klasës 0 — pra, shumica dërrmuese e rasteve pozitive u identifikuan saktë.
+Nga ana tjetër, specificity është vetëm 61.1%, që do të thotë se ka ende hapësirë për përmirësim në dallimin e klasës 1. Me fjalë të tjera, modeli nganjëherë e ngatërron klasën 1 me klasën 0. Kjo nënkupton një tendencë për të parashikuar më shpesh klasën 0.
+
+Besueshmëria e parashikimeve
+
+Modeli ka një precizion (positive predictive value) prej 80.6% për klasën 0, që do të thotë se nga të gjitha rastet që u parashikuan si klasa 0, mbi 80% ishin saktësisht të tilla. Ndërkohë, vlera negative e parashikimit është më e moderuar (73.3%), duke sugjeruar se parashikimet për klasën 1 janë më pak të besueshme.
+
+Random Forest ofron një performancë të fortë dhe të qëndrueshme në klasifikimin e Outcome. Ai është veçanërisht efektiv në identifikimin e rasteve pozitive (klasa 0) dhe është i balancuar mjaftueshëm për përdorim praktik, sidomos kur qëllimi është të minimizohet rreziku për të humbur raste të rëndësishme (false negatives).
+
+### 9) Modeli KNN (me normalizim të dhënash)
+```{r}
+# Normalizojmë veçoritë (pa Outcome)
+normalize <- function(x) { (x - min(x)) / (max(x) - min(x)) }
+train_norm <- as.data.frame(lapply(train_data[,-9], normalize))
+test_norm  <- as.data.frame(lapply(test_data[,-9], normalize))
+
+train_labels <- train_data$Outcome
+test_labels  <- test_data$Outcome
+
+# KNN me k=5
+pred_knn <- knn(train = train_norm, test = test_norm, cl = train_labels, k = 5)
+
+# Vlerësimi i modelit
+confusionMatrix(pred_knn, as.factor(test_labels))
+```
+
+Saktësia e përgjithshme
+
+Modeli KNN arrin një saktësi prej 74.5%, që do të thotë se gati 3 nga 4 raste janë parashikuar saktë. Përmirësimi i modelit është statistikisht i rëndësishëm me p-vlerë 0.0061.
+
+Besueshmëria e modelit
+
+Koeficienti Kappa prej 0.43 tregon që përputhja mes parashikimeve dhe rezultateve reale është mbi atë që do prisnim rastësisht, por nuk është shumë e fortë. Kjo do të thotë se modeli është në një fazë të mirë, por mund të përmirësohet më tej për të pasur një klasifikim më të besueshëm.
+
+Ekulibri mes klasave
+
+Në dallimin e klasave, modeli tregon një performancë më të mirë për klasën 0, me sensitivity të lartë prej 82.8%. Kjo tregon se modeli identifikon me sukses shumicën e rasteve të kësaj klase. Por për klasën 1, modeli është më pak i saktë, pasi specificity është vetëm 59.3%. Kjo do të thotë se shumë raste të klasës 1 ngatërrohen dhe klasifikohen gabimisht si 0.
+
+Besueshmëria e parashikimeve
+
+Parashikimet për klasën 0 janë më të besueshme, me një vlerë pozitive të parashikimit prej 78.9%, që tregon se kur modeli thotë “kjo është klasa 0”, ka shumë gjasa që të jetë e tillë në të vërtetë. Ndërsa parashikimet për klasën 1 kanë besueshmëri më të ulët, me një vlerë negative të parashikimit prej 65.3%.
+
+Modeli KNN me normalizim është efektiv në njohjen e klasës më të shpeshtë (klasa 0), por ka vështirësi në dallimin e mirë të klasës 1. Kjo është një sfidë e zakonshme kur klasat janë të pabarabarta ose të ngjashme në karakteristika. Përmirësimet mund të arrihen duke balancuar të dhënat ose duke përdorur metoda të tjera klasifikimi.
+
+
+### 10) Modeli SVM
+```{r}
+# Trajnimi i modelit SVM 
+model_svm <- svm(Outcome ~ ., data = train_data, kernel = "radial", probability = TRUE)
+
+# Parashikimi mbi test set
+pred_svm <- predict(model_svm, newdata = test_data)
+
+# Vlerësimi i modelit me matricën e konfuzionit
+conf_matrix <- confusionMatrix(pred_svm, test_labels)
+print(conf_matrix)
+```
+
+Saktësia e përgjithshme
+
+Modeli SVM ka arritur një saktësi totale prej rreth 75.8%. Kjo tregon që rreth 3 nga 4 parashikime janë të sakta. Përmirësimi është statistikisht i rëndësishëm, siç tregohet nga p-vlera prej 0.0021, që është shumë më e vogël se 0.05.
+
+Besueshmëria e modelit
+
+Vlera e koeficientit Kappa është 0.44, që tregon një përputhje të moderuar midis parashikimeve të modelit dhe të dhënave reale, përtej çfarëdo përputhjeje rastësore. Kjo do të thotë që modeli është i besueshëm, por ende ka hapësirë për përmirësim.
+
+Ekulibri mes klasave
+
+Sensitivity për klasën 0 është i lartë, në 87.9%, që do të thotë se modeli kap shumicën e rasteve të vërteta të kësaj klase. Kjo është shumë e rëndësishme, veçanërisht nëse klasa 0 është ajo që kërkon identifikim të shpejtë.
+Nga ana tjetër, specificity është më i ulët, në 53.7%, që do të thotë se modeli ka vështirësi në dallimin e saktë të klasës 1 dhe nganjëherë gabon duke e klasifikuar atë si klasë 0.
+
+Besueshmëria e parashikimeve
+
+Precision-i për klasën 0 është rreth 77.7%, që do të thotë se shumica e parashikimeve për këtë klasë janë të sakta. Ndërsa vlera negative e parashikimit është 70.7%, që tregon se parashikimet e klasës 1 janë pak më pak të besueshme, por prapë mjaft të pranueshme.
+
+Modeli SVM është efektiv dhe ka një ndjeshmëri të lartë për klasën pozitive (klasën 0). Megjithatë, performanca më e dobët për klasën 1 dhe evidenca për një bias të lehtë sugjerojnë që modeli ka hapësira për përmirësime që mund ta bëjnë më të besueshëm dhe të drejtë në klasifikim.
+
+### 11) Modeli XG-boost
+```{r}
+# Konvertimi i Outcome nga faktor/karakter në numeric 0/1 për XGBoost
+train_label <- as.numeric(as.character(train_data$Outcome))
+test_label  <- as.numeric(as.character(test_data$Outcome))
+
+# Nxjerrja e veçorive (pa Outcome)
+train_matrix <- as.matrix(train_data[, setdiff(names(train_data), "Outcome")])
+test_matrix  <- as.matrix(test_data[, setdiff(names(test_data), "Outcome")])
+
+# Krijimi i objekteve DMatrix për XGBoost
+dtrain <- xgb.DMatrix(data = train_matrix, label = train_label)
+dtest  <- xgb.DMatrix(data = test_matrix, label = test_label)
+
+# Parametrat e modelit
+params <- list(
+  booster = "gbtree",
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.1,
+  max_depth = 6,
+  min_child_weight = 1,
+  gamma = 0,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+# Watchlist për monitorim gjatë trajnimit
+watchlist <- list(train = dtrain, eval = dtest)
+
+# Trajnimi i modelit me early stopping
+set.seed(42)
+model_xgb <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100,
+  watchlist = watchlist,
+  early_stopping_rounds = 10,
+  print_every_n = 10,
+  maximize = TRUE
+)
+
+# Parashikimi i probabiliteteve në test
+pred_prob <- predict(model_xgb, dtest)
+
+# Konvertimi në klasë 0/1
+pred_label <- ifelse(pred_prob > 0.5, 1, 0)
+pred_label <- factor(pred_label, levels = c(0,1))
+test_label_factor <- factor(test_label, levels = c(0,1))
+
+# Matrica e konfuzionit dhe metrikat e performancës
+conf_matrix <- confusionMatrix(pred_label, test_label_factor)
+print(conf_matrix)
+```
+
+Saktësia e përgjithshme
+
+Modeli XGBoost ka treguar një saktësi të mirë në klasifikim, duke arritur të klasifikojë drejt rreth 79.7% të rasteve. Kjo është një performancë e mirë. Përmirësimi i këtij modeli është gjithashtu i qëndrueshëm dhe statistikisht i rëndësishëm, duke u mbështetur në një p-vlerë shumë të vogël, që konfirmon se modeli është shumë më efektiv sesa një klasifikues rastësor.
+
+Besueshmëria e modelit
+
+Sa i përket besueshmërisë së modelit, koeficienti Kappa është 0.54, që tregon një marrëveshje të mirë mes parashikimeve të modelit dhe të dhënave reale. Kjo tregon se modeli ka një besueshmëri të fortë dhe një aftësi të mirë për të bërë parashikime të sakta dhe të qëndrueshme në kohë.
+
+Ekulibri mes klasave
+
+Modeli tregon edhe një ekuilibër të kënaqshëm në performancën për të dy klasat. Ai identifikon shumë mirë klasën 0 me një vlerë të sensitivity prej afërsisht 87.9%, që do të thotë se shumica e rasteve të kësaj klase klasifikohen saktë. Në të njëjtën kohë, modeli ka edhe një specificity relativisht të mirë prej 64.8%, që do të thotë se është gjithashtu në gjendje të dallojë me saktësi një pjesë të mirë të rasteve që nuk janë në klasën 0, duke shmangur gabime të panevojshme në klasifikimin e klasës 1. Ky balancim është shumë i rëndësishëm, sepse siguron që modeli të mos favorizojë pa arsye njërën klasë në kurriz të tjetrës.
+
+Besueshmëria e parashikimeve
+
+Sa i përket besueshmërisë së parashikimeve individuale, modeli ka një vlerë pozitive të parashikimit (precision) prej 82.1%, që tregon se kur modeli parashikon se një rast është në klasën 0, ka shumë gjasa që të jetë i saktë. Gjithashtu, vlera negative e parashikimit është 74.5%, që do të thotë se edhe parashikimet për klasën 1 janë relativisht të besueshme, edhe pse pak më të pasigurta se ato për klasën 0. Testi i McNemar-it konfirmon se nuk ka një tendencë të dukshme për të bërë më shumë gabime në njërën apo tjetrën prej klasave, duke treguar që modeli është i drejtë në mënyrën se si trajton gabimet e tij.
+
+Modeli XGBoost është një model shumë i fuqishëm dhe i balancuar për klasifikim. Ai kombinon saktësinë e lartë me besueshmërinë dhe një ekuilibër të mirë midis klasave, duke e bërë atë të përshtatshëm për aplikime ku është e rëndësishme të minimizohen gabimet e klasifikimit në të dy drejtimet. Për më tej, mund të konsiderohen përmirësime si tuning më i detajuar i hiperparametrave.
+
+###  Faleminderit për vëmendjen tuaj !!!
